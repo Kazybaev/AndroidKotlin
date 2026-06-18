@@ -37,6 +37,11 @@ android {
             "DIFY_BASE_URL",
             "\"${configuredValue("DIFY_BASE_URL", "https://api.dify.ai")}\""
         )
+        buildConfigField(
+            "String",
+            "DIFY_API_MODE",
+            "\"${configuredValue("DIFY_API_MODE", "chat")}\""
+        )
     }
 
     buildTypes {

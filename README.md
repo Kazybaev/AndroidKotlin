@@ -1,4 +1,4 @@
-# AURA — голосовой ассистент на Dify
+# NurAI — голосовой ассистент на Dify
 
 Приложение распознаёт русскую речь, отправляет текст в Dify Chat API и озвучивает ответ
 системным Android Text-to-Speech.
@@ -9,7 +9,8 @@
 
 ```properties
 DIFY_API_KEY=app-ваш_ключ
-DIFY_BASE_URL=https://dify.trade.kg
+DIFY_BASE_URL=https://api.dify.ai/v1
+DIFY_API_MODE=workflow
 ```
 
 После изменения выполните Sync Project with Gradle Files и запустите приложение.

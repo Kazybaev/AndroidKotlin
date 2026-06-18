@@ -1,6 +1,7 @@
 package com.example.my
 
 import android.Manifest
+import android.media.AudioAttributes
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Bundle
@@ -102,14 +103,23 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     private var transcript by mutableStateOf("")
     private var answer by mutableStateOf("")
     private var statusMessage by mutableStateOf("Готова слушать")
+    private var inputLevel by mutableStateOf(0f)
+    private var isVoiceSessionActive by mutableStateOf(false)
     private var conversationId = ""
+    private var accumulatedSpeech = ""
     private var speechRecognizer: SpeechRecognizer? = null
     private var textToSpeech: TextToSpeech? = null
+    private var isTtsReady = false
+    private var pendingSpeech: String? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val submitSpeechRunnable = Runnable { submitAccumulatedSpeech() }
+    private val restartListeningRunnable = Runnable {
+        if (isVoiceSessionActive && state == AssistantState.LISTENING) startListening()
+    }
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-            if (granted) startListening() else showError("Нужен доступ к микрофону")
+            if (granted) startVoiceSession() else showError("Нужен доступ к микрофону")
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -123,34 +133,56 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                     transcript = transcript,
                     answer = answer,
                     statusMessage = statusMessage,
+                    inputLevel = inputLevel,
+                    isVoiceSessionActive = isVoiceSessionActive,
                     isConfigured = BuildConfig.DIFY_API_KEY.isNotBlank(),
                     onVoiceTap = ::handleVoiceTap,
                     onSuggestion = ::sendQuestion,
-                    onStopSpeaking = ::stopSpeaking
+                    onStopSpeaking = ::stopSpeaking,
+                    onReplayAnswer = { if (answer.isNotBlank()) speak(answer) }
                 )
             }
         }
     }
 
     private fun handleVoiceTap() {
-        when (state) {
-            AssistantState.LISTENING -> speechRecognizer?.stopListening()
-            AssistantState.SPEAKING -> stopSpeaking()
-            AssistantState.THINKING -> Unit
-            else -> {
-                if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
-                    PackageManager.PERMISSION_GRANTED
-                ) {
-                    startListening()
-                } else {
-                    permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                }
-            }
+        if (isVoiceSessionActive) {
+            stopVoiceSession()
+        } else if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            startVoiceSession()
+        } else {
+            permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
         }
     }
 
+    private fun startVoiceSession() {
+        isVoiceSessionActive = true
+        accumulatedSpeech = ""
+        transcript = ""
+        answer = ""
+        startListening()
+    }
+
+    private fun stopVoiceSession() {
+        isVoiceSessionActive = false
+        mainHandler.removeCallbacks(submitSpeechRunnable)
+        mainHandler.removeCallbacks(restartListeningRunnable)
+        accumulatedSpeech = ""
+        inputLevel = 0f
+        speechRecognizer?.cancel()
+        speechRecognizer?.destroy()
+        speechRecognizer = null
+        textToSpeech?.stop()
+        state = AssistantState.IDLE
+        statusMessage = "Голосовой режим остановлен"
+    }
+
     private fun startListening() {
+        if (!isVoiceSessionActive) return
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            isVoiceSessionActive = false
             showError("Распознавание речи недоступно на устройстве")
             return
         }
@@ -160,27 +192,48 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
             setRecognitionListener(object : RecognitionListener {
                 override fun onReadyForSpeech(params: Bundle?) {
                     state = AssistantState.LISTENING
-                    statusMessage = "Слушаю вас…"
-                    transcript = ""
+                    statusMessage = if (accumulatedSpeech.isBlank()) {
+                        "Слушаю вас…"
+                    } else {
+                        "Можете продолжить…"
+                    }
+                    inputLevel = 0f
                 }
 
                 override fun onBeginningOfSpeech() = Unit
-                override fun onRmsChanged(rmsdB: Float) = Unit
+                override fun onRmsChanged(rmsdB: Float) {
+                    inputLevel = ((rmsdB + 2f) / 12f).coerceIn(0f, 1f)
+                }
                 override fun onBufferReceived(buffer: ByteArray?) = Unit
                 override fun onEndOfSpeech() {
-                    state = AssistantState.THINKING
-                    statusMessage = "Формулирую ответ…"
+                    inputLevel = 0f
+                    if (isVoiceSessionActive) {
+                        state = AssistantState.LISTENING
+                        statusMessage = "Жду продолжение…"
+                    }
                 }
 
                 override fun onError(error: Int) {
-                    val message = when (error) {
-                        SpeechRecognizer.ERROR_NO_MATCH -> "Не удалось разобрать речь"
-                        SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "Я ничего не услышала"
+                    inputLevel = 0f
+                    if (!isVoiceSessionActive) return
+                    when (error) {
+                        SpeechRecognizer.ERROR_NO_MATCH,
+                        SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> {
+                            if (accumulatedSpeech.isNotBlank()) scheduleQuestionSubmission()
+                            else {
+                                statusMessage = "Жду ваш вопрос…"
+                                scheduleListeningRestart(350L)
+                            }
+                        }
                         SpeechRecognizer.ERROR_NETWORK,
-                        SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Ошибка распознавания речи"
-                        else -> "Попробуйте сказать ещё раз"
+                        SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> {
+                            statusMessage = "Ошибка распознавания. Повторяю…"
+                            scheduleListeningRestart(1_000L)
+                        }
+                        SpeechRecognizer.ERROR_RECOGNIZER_BUSY ->
+                            scheduleListeningRestart(500L)
+                        else -> scheduleListeningRestart(500L)
                     }
-                    showError(message)
                 }
 
                 override fun onResults(results: Bundle?) {
@@ -188,15 +241,25 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                         ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                         ?.firstOrNull()
                         .orEmpty()
-                    if (text.isBlank()) showError("Не удалось разобрать речь")
-                    else sendQuestion(text)
+                    if (text.isNotBlank()) {
+                        accumulatedSpeech = listOf(accumulatedSpeech, text)
+                            .filter(String::isNotBlank)
+                            .joinToString(" ")
+                            .trim()
+                        transcript = accumulatedSpeech
+                        scheduleQuestionSubmission()
+                    }
+                    scheduleListeningRestart(250L)
                 }
 
                 override fun onPartialResults(partialResults: Bundle?) {
-                    transcript = partialResults
+                    val partial = partialResults
                         ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                         ?.firstOrNull()
                         .orEmpty()
+                    transcript = listOf(accumulatedSpeech, partial)
+                        .filter(String::isNotBlank)
+                        .joinToString(" ")
                 }
 
                 override fun onEvent(eventType: Int, params: Bundle?) = Unit
@@ -208,11 +271,42 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                         RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
                     )
                     putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ru-RU")
+                    putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "ru-RU")
                     putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
                     putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+                    putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false)
+                    putExtra(
+                        RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS,
+                        1_000L
+                    )
+                    putExtra(
+                        RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS,
+                        900L
+                    )
                 }
             )
         }
+    }
+
+    private fun scheduleQuestionSubmission() {
+        mainHandler.removeCallbacks(submitSpeechRunnable)
+        mainHandler.postDelayed(submitSpeechRunnable, 1_400L)
+    }
+
+    private fun scheduleListeningRestart(delay: Long) {
+        mainHandler.removeCallbacks(restartListeningRunnable)
+        mainHandler.postDelayed(restartListeningRunnable, delay)
+    }
+
+    private fun submitAccumulatedSpeech() {
+        val question = accumulatedSpeech.trim()
+        if (!isVoiceSessionActive || question.isBlank()) return
+        mainHandler.removeCallbacks(restartListeningRunnable)
+        speechRecognizer?.cancel()
+        speechRecognizer?.destroy()
+        speechRecognizer = null
+        accumulatedSpeech = ""
+        sendQuestion(question)
     }
 
     private fun sendQuestion(question: String) {
@@ -249,19 +343,43 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     }
 
     private fun speak(text: String) {
+        if (!isTtsReady) {
+            pendingSpeech = text
+            state = AssistantState.SPEAKING
+            statusMessage = "Подготавливаю голос…"
+            return
+        }
         state = AssistantState.SPEAKING
         statusMessage = "Отвечаю…"
-        val result = textToSpeech?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "dify-answer")
+        val spokenText = text
+            .replace(Regex("""https?://\S+"""), "Ссылка указана на экране.")
+            .replace(Regex("""[*_#`]"""), "")
+            .replace("•", "")
+        val speechParams = Bundle().apply {
+            putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1f)
+        }
+        val result = textToSpeech?.speak(
+            spokenText,
+            TextToSpeech.QUEUE_FLUSH,
+            speechParams,
+            "dify-answer"
+        )
         if (result == TextToSpeech.ERROR) {
             state = AssistantState.IDLE
-            statusMessage = "Ответ готов"
+            statusMessage = "Не удалось включить озвучивание"
         }
     }
 
     private fun stopSpeaking() {
         textToSpeech?.stop()
-        state = AssistantState.IDLE
-        statusMessage = "Озвучивание остановлено"
+        if (isVoiceSessionActive) {
+            state = AssistantState.LISTENING
+            statusMessage = "Слушаю следующий вопрос…"
+            mainHandler.postDelayed({ startListening() }, 250L)
+        } else {
+            state = AssistantState.IDLE
+            statusMessage = "Озвучивание остановлено"
+        }
     }
 
     private fun showError(message: String) {
@@ -277,8 +395,33 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
 
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
-            textToSpeech?.language = Locale.forLanguageTag("ru-RU")
-            textToSpeech?.setSpeechRate(1.02f)
+            val engine = textToSpeech ?: return
+            val languageResult = engine.setLanguage(Locale.forLanguageTag("ru-RU"))
+            if (languageResult == TextToSpeech.LANG_MISSING_DATA ||
+                languageResult == TextToSpeech.LANG_NOT_SUPPORTED
+            ) {
+                engine.language = Locale.forLanguageTag("ru")
+            }
+            engine.voices
+                ?.filter { it.locale.language == "ru" && !it.isNetworkConnectionRequired }
+                ?.sortedByDescending { voice ->
+                    val name = voice.name.lowercase()
+                    when {
+                        "ruf" in name || "female" in name -> 3
+                        "local" in name || "embedded" in name -> 2
+                        else -> 1
+                    }
+                }
+                ?.firstOrNull()
+                ?.let { engine.voice = it }
+            engine.setSpeechRate(0.98f)
+            engine.setPitch(1f)
+            engine.setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
             textToSpeech?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(utteranceId: String?) = Unit
                 override fun onError(utteranceId: String?) {
@@ -291,12 +434,29 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                 override fun onDone(utteranceId: String?) {
                     mainHandler.post {
                         if (state == AssistantState.SPEAKING) {
-                            state = AssistantState.IDLE
-                            statusMessage = "Можно спросить ещё"
+                            if (isVoiceSessionActive) {
+                                state = AssistantState.LISTENING
+                                statusMessage = "Слушаю следующий вопрос…"
+                                mainHandler.postDelayed({ startListening() }, 350L)
+                            } else {
+                                state = AssistantState.IDLE
+                                statusMessage = "Можно спросить ещё"
+                            }
                         }
                     }
                 }
             })
+            isTtsReady = true
+            pendingSpeech?.let { queuedText ->
+                pendingSpeech = null
+                mainHandler.post { speak(queuedText) }
+            }
+        } else {
+            isTtsReady = false
+            mainHandler.post {
+                state = AssistantState.ERROR
+                statusMessage = "На устройстве не работает синтез речи"
+            }
         }
     }
 
@@ -313,7 +473,12 @@ private object DifyClient {
 
     fun ask(question: String, conversationId: String): Result {
         val baseUrl = BuildConfig.DIFY_BASE_URL.trimEnd('/').removeSuffix("/v1")
-        val endpoint = "$baseUrl/v1/chat-messages"
+        val isWorkflow = BuildConfig.DIFY_API_MODE.equals("workflow", ignoreCase = true)
+        val endpoint = if (isWorkflow) {
+            "$baseUrl/v1/workflows/run"
+        } else {
+            "$baseUrl/v1/chat-messages"
+        }
         val connection = (URL(endpoint).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             connectTimeout = 15_000
@@ -324,11 +489,16 @@ private object DifyClient {
             setRequestProperty("Content-Type", "application/json")
         }
         val body = JSONObject().apply {
-            put("inputs", JSONObject())
-            put("query", question)
+            put(
+                "inputs",
+                if (isWorkflow) JSONObject().put("query", question) else JSONObject()
+            )
+            if (!isWorkflow) put("query", question)
             put("response_mode", "blocking")
             put("user", "aura-android-user")
-            if (conversationId.isNotBlank()) put("conversation_id", conversationId)
+            if (!isWorkflow && conversationId.isNotBlank()) {
+                put("conversation_id", conversationId)
+            }
         }.toString()
 
         connection.outputStream.bufferedWriter().use { it.write(body) }
@@ -343,23 +513,68 @@ private object DifyClient {
                 ?: "Dify вернул ошибку $responseCode")
         }
         val json = JSONObject(responseText)
-        val rawAnswer = json.optString("answer")
+        val rawAnswer = if (isWorkflow) {
+            extractWorkflowOutput(json)
+        } else {
+            json.optString("answer")
+        }
         return Result(
             answer = extractAnswerText(rawAnswer),
-            conversationId = json.optString("conversation_id")
+            conversationId = if (isWorkflow) "" else json.optString("conversation_id")
         )
     }
 
-    private fun extractAnswerText(rawAnswer: String): String {
-        if (rawAnswer.isBlank()) return "Dify не вернул текст ответа"
-        return runCatching {
-            val nested = JSONObject(rawAnswer)
-            nested.optString("reply")
-                .ifBlank { nested.optString("answer") }
-                .ifBlank { nested.optString("text") }
-                .ifBlank { rawAnswer }
-        }.getOrDefault(rawAnswer)
+    private fun extractWorkflowOutput(response: JSONObject): String {
+        val data = response.optJSONObject("data")
+            ?: return response.optString("answer")
+        val outputs = data.optJSONObject("outputs")
+            ?: return data.optString("output")
+
+        return listOf("text", "answer", "reply", "output", "result")
+            .asSequence()
+            .mapNotNull { key ->
+                if (outputs.isNull(key)) null else outputs.opt(key)?.toString()
+            }
+            .firstOrNull { value -> value.isUsefulAnswer() }
+            ?: outputs.toString()
     }
+
+    private fun extractAnswerText(rawAnswer: String): String {
+        val cleaned = rawAnswer
+            .trim()
+            .removePrefix("```json")
+            .removePrefix("```")
+            .removeSuffix("```")
+            .trim()
+
+        if (!cleaned.isUsefulAnswer()) return NO_ANSWER_MESSAGE
+
+        return runCatching {
+            val nested = JSONObject(cleaned)
+            val directAnswer = listOf("reply", "answer", "text", "output", "result", "message")
+                .asSequence()
+                .mapNotNull { key ->
+                    if (nested.isNull(key)) null else nested.optString(key)
+                }
+                .firstOrNull { value -> value.isUsefulAnswer() }
+
+            directAnswer ?: when (nested.optString("reason")) {
+                "out_of_scope" -> OUT_OF_SCOPE_MESSAGE
+                else -> NO_ANSWER_MESSAGE
+            }
+        }.getOrDefault(cleaned)
+    }
+
+    private fun String.isUsefulAnswer(): Boolean =
+        isNotBlank() && !equals("null", ignoreCase = true) &&
+            !equals("undefined", ignoreCase = true)
+
+    private const val NO_ANSWER_MESSAGE =
+        "Не удалось получить текст ответа. Уточните нотариальный вопрос и попробуйте ещё раз."
+
+    private const val OUT_OF_SCOPE_MESSAGE =
+        "Сейчас я отвечаю только на вопросы о нотариальных услугах Кыргызской Республики. " +
+            "Уточните, какая нотариальная услуга вам нужна."
 }
 
 @Composable
@@ -368,10 +583,13 @@ private fun VoiceAssistantScreen(
     transcript: String,
     answer: String,
     statusMessage: String,
+    inputLevel: Float,
+    isVoiceSessionActive: Boolean,
     isConfigured: Boolean,
     onVoiceTap: () -> Unit,
     onSuggestion: (String) -> Unit,
-    onStopSpeaking: () -> Unit
+    onStopSpeaking: () -> Unit,
+    onReplayAnswer: () -> Unit
 ) {
     val background = Brush.radialGradient(
         colors = listOf(Color(0xFF12342F), AuraBackground),
@@ -404,10 +622,18 @@ private fun VoiceAssistantScreen(
                     AssistantState.IDLE -> if (answer.isBlank()) "О чём поговорим?" else "Спросите ещё"
                 },
                 style = MaterialTheme.typography.displaySmall,
+                color = AuraText,
                 textAlign = TextAlign.Center
             )
             Spacer(Modifier.height(10.dp))
-            AnimatedContent(targetState = statusMessage, label = "status") { message ->
+            val visibleStatus = if (
+                state == AssistantState.LISTENING && inputLevel > 0.08f
+            ) {
+                "Слышу голос…"
+            } else {
+                statusMessage
+            }
+            AnimatedContent(targetState = visibleStatus, label = "status") { message ->
                 Text(
                     text = message,
                     color = if (state == AssistantState.ERROR)
@@ -417,9 +643,9 @@ private fun VoiceAssistantScreen(
                 )
             }
             Spacer(Modifier.height(34.dp))
-            VoiceOrb(state = state, onClick = onVoiceTap)
+            VoiceOrb(state = state, inputLevel = inputLevel, onClick = onVoiceTap)
             Spacer(Modifier.height(34.dp))
-            ConversationCard(transcript, answer, state, onStopSpeaking)
+            ConversationCard(transcript, answer, state, onStopSpeaking, onReplayAnswer)
             Spacer(Modifier.weight(1f))
             AnimatedVisibility(
                 visible = transcript.isBlank() && answer.isBlank(),
@@ -430,11 +656,10 @@ private fun VoiceAssistantScreen(
             }
             Spacer(Modifier.height(14.dp))
             Text(
-                text = when (state) {
-                    AssistantState.LISTENING -> "Нажмите, чтобы закончить"
-                    AssistantState.SPEAKING -> "Нажмите на сферу, чтобы остановить"
-                    AssistantState.THINKING -> "Запрос отправлен в Dify"
-                    else -> "Нажмите на сферу и задайте вопрос"
+                text = when {
+                    isVoiceSessionActive ->
+                        "Голосовой режим включён · нажмите сферу, чтобы остановить"
+                    else -> "Нажмите на сферу, чтобы включить постоянный диалог"
                 },
                 color = AuraTextMuted,
                 style = MaterialTheme.typography.bodyMedium,
@@ -456,14 +681,19 @@ private fun Header(isConfigured: Boolean) {
                 .background(Brush.linearGradient(listOf(AuraMint, AuraCyan)), CircleShape),
             contentAlignment = Alignment.Center
         ) {
-            Text("A", color = AuraBackground, fontWeight = FontWeight.Bold)
+            Text("N", color = AuraBackground, fontWeight = FontWeight.Bold)
         }
         Spacer(Modifier.width(12.dp))
-        Column {
-            Text("AURA", fontWeight = FontWeight.SemiBold, color = AuraText)
-            Text("Голосовой AI-ассистент", style = MaterialTheme.typography.bodyMedium, color = AuraTextMuted)
+        Column(modifier = Modifier.weight(1f)) {
+            Text("NurAI", fontWeight = FontWeight.SemiBold, color = AuraText)
+            Text(
+                "Единое окно нотариальных услуг КР",
+                style = MaterialTheme.typography.bodyMedium,
+                color = AuraTextMuted,
+                maxLines = 1
+            )
         }
-        Spacer(Modifier.weight(1f))
+        Spacer(Modifier.width(8.dp))
         Row(
             modifier = Modifier
                 .clip(RoundedCornerShape(50))
@@ -479,9 +709,10 @@ private fun Header(isConfigured: Boolean) {
             )
             Spacer(Modifier.width(7.dp))
             Text(
-                if (isConfigured) "Dify online" else "Демо",
+                if (isConfigured) "Online" else "Демо",
                 style = MaterialTheme.typography.labelLarge,
-                color = AuraText
+                color = AuraText,
+                maxLines = 1
             )
         }
     }
@@ -516,7 +747,7 @@ private fun BoxScope.AmbientGlow(state: AssistantState) {
 }
 
 @Composable
-private fun VoiceOrb(state: AssistantState, onClick: () -> Unit) {
+private fun VoiceOrb(state: AssistantState, inputLevel: Float, onClick: () -> Unit) {
     val transition = rememberInfiniteTransition(label = "voiceOrb")
     val pulse by transition.animateFloat(
         initialValue = 1f,
@@ -538,7 +769,7 @@ private fun VoiceOrb(state: AssistantState, onClick: () -> Unit) {
     Box(
         modifier = Modifier
             .size(174.dp)
-            .scale(pulse)
+            .scale(if (state == AssistantState.LISTENING) pulse + inputLevel * 0.10f else pulse)
             .semantics { contentDescription = "Кнопка голосового ассистента" }
             .clickable(
                 interactionSource = MutableInteractionSource(),
@@ -655,7 +886,8 @@ private fun ConversationCard(
     transcript: String,
     answer: String,
     state: AssistantState,
-    onStopSpeaking: () -> Unit
+    onStopSpeaking: () -> Unit,
+    onReplayAnswer: () -> Unit
 ) {
     AnimatedVisibility(
         visible = transcript.isNotBlank() || answer.isNotBlank(),
@@ -679,21 +911,29 @@ private fun ConversationCard(
             }
             if (answer.isNotBlank()) {
                 Spacer(Modifier.height(18.dp))
-                Text("AURA", style = MaterialTheme.typography.labelLarge, color = AuraCyan)
+                Text("NurAI", style = MaterialTheme.typography.labelLarge, color = AuraCyan)
                 Spacer(Modifier.height(6.dp))
                 Text(answer, style = MaterialTheme.typography.bodyLarge, color = AuraText)
-                if (state == AssistantState.SPEAKING) {
-                    Spacer(Modifier.height(14.dp))
-                    Text(
-                        "Остановить озвучивание",
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(12.dp))
-                            .clickable(onClick = onStopSpeaking)
-                            .padding(vertical = 8.dp),
-                        color = AuraMint,
-                        style = MaterialTheme.typography.labelLarge
-                    )
-                }
+                Spacer(Modifier.height(14.dp))
+                Text(
+                    if (state == AssistantState.SPEAKING) {
+                        "Остановить озвучивание"
+                    } else {
+                        "Озвучить ответ"
+                    },
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(12.dp))
+                        .clickable(
+                            onClick = if (state == AssistantState.SPEAKING) {
+                                onStopSpeaking
+                            } else {
+                                onReplayAnswer
+                            }
+                        )
+                        .padding(vertical = 8.dp),
+                    color = AuraMint,
+                    style = MaterialTheme.typography.labelLarge
+                )
             }
         }
     }
@@ -702,9 +942,9 @@ private fun ConversationCard(
 @Composable
 private fun Suggestions(onSuggestion: (String) -> Unit) {
     val suggestions = listOf(
-        "Что ты умеешь?",
-        "Составь план на день",
-        "Расскажи что-нибудь интересное"
+        "Документы для доверенности",
+        "Как оформить наследство?",
+        "Как найти нотариуса?"
     )
     Row(
         modifier = Modifier
@@ -744,10 +984,13 @@ private fun VoiceAssistantPreview() {
             transcript = "",
             answer = "",
             statusMessage = "Готова слушать",
+            inputLevel = 0f,
+            isVoiceSessionActive = false,
             isConfigured = false,
             onVoiceTap = {},
             onSuggestion = {},
-            onStopSpeaking = {}
+            onStopSpeaking = {},
+            onReplayAnswer = {}
         )
     }
 }
