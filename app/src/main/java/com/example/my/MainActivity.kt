@@ -414,8 +414,8 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                 }
                 ?.firstOrNull()
                 ?.let { engine.voice = it }
-            engine.setSpeechRate(0.98f)
-            engine.setPitch(1f)
+            engine.setSpeechRate(0.94f)
+            engine.setPitch(1.12f)
             engine.setAudioAttributes(
                 AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
@@ -748,18 +748,18 @@ private fun BoxScope.AmbientGlow(state: AssistantState) {
 
 @Composable
 private fun VoiceOrb(state: AssistantState, inputLevel: Float, onClick: () -> Unit) {
-    val transition = rememberInfiniteTransition(label = "voiceOrb")
+    val transition = rememberInfiniteTransition(label = "robotFace")
     val pulse by transition.animateFloat(
-        initialValue = 1f,
-        targetValue = if (state == AssistantState.LISTENING || state == AssistantState.SPEAKING) 1.08f else 1.02f,
-        animationSpec = infiniteRepeatable(tween(720), RepeatMode.Reverse),
-        label = "orbPulse"
-    )
-    val spin by transition.animateFloat(
         initialValue = 0f,
-        targetValue = 360f,
-        animationSpec = infiniteRepeatable(tween(3600)),
-        label = "orbSpin"
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(620), RepeatMode.Reverse),
+        label = "facePulse"
+    )
+    val blink by transition.animateFloat(
+        initialValue = 1f,
+        targetValue = 0.82f,
+        animationSpec = infiniteRepeatable(tween(1_800), RepeatMode.Reverse),
+        label = "blink"
     )
     val accent = when (state) {
         AssistantState.ERROR -> Color(0xFFFF8B82)
@@ -768,114 +768,161 @@ private fun VoiceOrb(state: AssistantState, inputLevel: Float, onClick: () -> Un
     }
     Box(
         modifier = Modifier
-            .size(174.dp)
-            .scale(if (state == AssistantState.LISTENING) pulse + inputLevel * 0.10f else pulse)
-            .semantics { contentDescription = "Кнопка голосового ассистента" }
+            .size(width = 226.dp, height = 166.dp)
+            .scale(
+                if (state == AssistantState.LISTENING) {
+                    1f + inputLevel * 0.045f
+                } else {
+                    1f
+                }
+            )
+            .semantics { contentDescription = "Лицо и кнопка голосового ассистента NurAI" }
             .clickable(
                 interactionSource = MutableInteractionSource(),
                 indication = null,
-                enabled = state != AssistantState.THINKING,
                 onClick = onClick
             ),
         contentAlignment = Alignment.Center
     ) {
-        Canvas(Modifier.fillMaxSize()) {
-            drawCircle(
-                brush = Brush.sweepGradient(
-                    listOf(accent.copy(alpha = 0.08f), accent, AuraCyan, accent.copy(alpha = 0.08f)),
-                    center = center
-                ),
-                style = Stroke(3.dp.toPx(), cap = StrokeCap.Round)
-            )
-            if (state == AssistantState.THINKING) {
-                val angle = Math.toRadians(spin.toDouble())
-                val radius = size.minDimension * 0.47f
-                drawCircle(
-                    color = Color.White,
-                    radius = 5.dp.toPx(),
-                    center = Offset(
-                        center.x + cos(angle).toFloat() * radius,
-                        center.y + sin(angle).toFloat() * radius
-                    )
-                )
-            }
-        }
         Box(
             Modifier
-                .size(142.dp)
+                .fillMaxSize()
                 .background(
                     Brush.radialGradient(
-                        listOf(accent.copy(alpha = 0.34f), AuraSurfaceHigh, AuraSurface)
+                        listOf(accent.copy(alpha = 0.20f), AuraSurfaceHigh, AuraBackground)
                     ),
-                    CircleShape
+                    RoundedCornerShape(52.dp)
                 )
-                .border(1.dp, Color.White.copy(alpha = 0.14f), CircleShape),
+                .border(
+                    2.dp,
+                    Brush.linearGradient(
+                        listOf(accent.copy(alpha = 0.95f), AuraCyan.copy(alpha = 0.35f))
+                    ),
+                    RoundedCornerShape(52.dp)
+                ),
             contentAlignment = Alignment.Center
         ) {
-            Crossfade(state, label = "orbIcon") {
-                if (it == AssistantState.THINKING) ThinkingIcon(accent)
-                else MicrophoneIcon(accent, it == AssistantState.LISTENING)
+            RobotFace(state, accent, inputLevel, pulse, blink)
+        }
+    }
+}
+
+@Composable
+private fun RobotFace(
+    state: AssistantState,
+    color: Color,
+    inputLevel: Float,
+    pulse: Float,
+    blink: Float
+) {
+    Canvas(Modifier.size(width = 166.dp, height = 108.dp)) {
+        val eyeY = size.height * 0.38f
+        val leftX = size.width * 0.30f
+        val rightX = size.width * 0.70f
+        val stroke = 5.dp.toPx()
+        val glow = color.copy(alpha = 0.20f)
+
+        drawCircle(glow, 19.dp.toPx(), Offset(leftX, eyeY))
+        drawCircle(glow, 19.dp.toPx(), Offset(rightX, eyeY))
+
+        when (state) {
+            AssistantState.IDLE -> {
+                drawArc(
+                    color, 10f, 160f, false,
+                    Offset(leftX - 15.dp.toPx(), eyeY - 8.dp.toPx()),
+                    Size(30.dp.toPx(), 18.dp.toPx()),
+                    style = Stroke(stroke, cap = StrokeCap.Round)
+                )
+                drawArc(
+                    color, 10f, 160f, false,
+                    Offset(rightX - 15.dp.toPx(), eyeY - 8.dp.toPx()),
+                    Size(30.dp.toPx(), 18.dp.toPx()),
+                    style = Stroke(stroke, cap = StrokeCap.Round)
+                )
+            }
+            AssistantState.LISTENING -> {
+                val radius = (8f + inputLevel * 4f).dp.toPx()
+                drawOval(
+                    color,
+                    Offset(leftX - radius, eyeY - radius * blink),
+                    Size(radius * 2f, radius * 2f * blink)
+                )
+                drawOval(
+                    color,
+                    Offset(rightX - radius, eyeY - radius * blink),
+                    Size(radius * 2f, radius * 2f * blink)
+                )
+            }
+            AssistantState.THINKING -> {
+                drawCircle(color, 8.dp.toPx(), Offset(leftX, eyeY))
+                drawLine(
+                    color,
+                    Offset(rightX - 12.dp.toPx(), eyeY),
+                    Offset(rightX + 12.dp.toPx(), eyeY),
+                    stroke,
+                    StrokeCap.Round
+                )
+            }
+            AssistantState.SPEAKING -> {
+                drawArc(
+                    color, 10f, 160f, false,
+                    Offset(leftX - 14.dp.toPx(), eyeY - 7.dp.toPx()),
+                    Size(28.dp.toPx(), 16.dp.toPx()),
+                    style = Stroke(stroke, cap = StrokeCap.Round)
+                )
+                drawArc(
+                    color, 10f, 160f, false,
+                    Offset(rightX - 14.dp.toPx(), eyeY - 7.dp.toPx()),
+                    Size(28.dp.toPx(), 16.dp.toPx()),
+                    style = Stroke(stroke, cap = StrokeCap.Round)
+                )
+            }
+            AssistantState.ERROR -> {
+                drawLine(
+                    color,
+                    Offset(leftX - 11.dp.toPx(), eyeY - 6.dp.toPx()),
+                    Offset(leftX + 11.dp.toPx(), eyeY + 5.dp.toPx()),
+                    stroke,
+                    StrokeCap.Round
+                )
+                drawLine(
+                    color,
+                    Offset(rightX - 11.dp.toPx(), eyeY + 5.dp.toPx()),
+                    Offset(rightX + 11.dp.toPx(), eyeY - 6.dp.toPx()),
+                    stroke,
+                    StrokeCap.Round
+                )
             }
         }
-    }
-}
 
-@Composable
-private fun MicrophoneIcon(color: Color, listening: Boolean) {
-    Canvas(Modifier.size(58.dp)) {
-        val stroke = 4.dp.toPx()
-        drawRoundRect(
-            color = color,
-            topLeft = Offset(size.width * 0.34f, size.height * 0.10f),
-            size = Size(size.width * 0.32f, size.height * 0.48f),
-            cornerRadius = androidx.compose.ui.geometry.CornerRadius(20f, 20f),
-            style = Stroke(stroke)
-        )
-        drawArc(
-            color = color,
-            startAngle = 0f,
-            sweepAngle = 180f,
-            useCenter = false,
-            topLeft = Offset(size.width * 0.20f, size.height * 0.28f),
-            size = Size(size.width * 0.60f, size.height * 0.48f),
-            style = Stroke(stroke, cap = StrokeCap.Round)
-        )
-        drawLine(
-            color,
-            Offset(size.width / 2, size.height * 0.76f),
-            Offset(size.width / 2, size.height * 0.90f),
-            stroke,
-            StrokeCap.Round
-        )
-        drawLine(
-            color,
-            Offset(size.width * 0.37f, size.height * 0.90f),
-            Offset(size.width * 0.63f, size.height * 0.90f),
-            stroke,
-            StrokeCap.Round
-        )
-        if (listening) {
-            drawArc(
-                color.copy(alpha = 0.35f),
-                -55f,
-                110f,
-                false,
-                Offset(-4f, size.height * 0.10f),
-                Size(size.width + 8f, size.height * 0.72f),
-                style = Stroke(2.dp.toPx(), cap = StrokeCap.Round)
+        val mouthY = size.height * 0.72f
+        when (state) {
+            AssistantState.THINKING -> repeat(3) { index ->
+                drawCircle(
+                    color.copy(alpha = 0.45f + index * 0.25f),
+                    (3f + index).dp.toPx(),
+                    Offset(size.width * (0.42f + index * 0.08f), mouthY)
+                )
+            }
+            AssistantState.SPEAKING -> {
+                val mouthHeight = (12f + pulse * 12f).dp.toPx()
+                drawOval(
+                    color,
+                    Offset(size.width * 0.39f, mouthY - mouthHeight / 2f),
+                    Size(size.width * 0.22f, mouthHeight)
+                )
+            }
+            AssistantState.ERROR -> drawArc(
+                color, 195f, 150f, false,
+                Offset(size.width * 0.39f, mouthY - 2.dp.toPx()),
+                Size(size.width * 0.22f, 18.dp.toPx()),
+                style = Stroke(stroke, cap = StrokeCap.Round)
             )
-        }
-    }
-}
-
-@Composable
-private fun ThinkingIcon(color: Color) {
-    Canvas(Modifier.size(58.dp)) {
-        repeat(3) { index ->
-            drawCircle(
-                color = color.copy(alpha = 0.45f + index * 0.25f),
-                radius = (5 + index).dp.toPx(),
-                center = Offset(size.width * (0.25f + index * 0.25f), size.height / 2)
+            else -> drawArc(
+                color, 20f, 140f, false,
+                Offset(size.width * 0.37f, mouthY - 12.dp.toPx()),
+                Size(size.width * 0.26f, 25.dp.toPx()),
+                style = Stroke(stroke, cap = StrokeCap.Round)
             )
         }
     }
