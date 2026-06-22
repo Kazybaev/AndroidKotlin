@@ -1,5 +1,6 @@
 package com.example.my
 
+import android.annotation.SuppressLint
 import android.Manifest
 import android.media.AudioAttributes
 import android.content.Intent
@@ -98,25 +99,7 @@ import kotlin.math.cos
 import kotlin.math.sin
 
 enum class AssistantState { IDLE, LISTENING, THINKING, SPEAKING, ERROR }
-private enum class ListeningMode { OFF, WAKE_WORD, CONVERSATION }
-
-private const val WAKE_GREETING = "Здравствуйте! Чем могу быть полезна?"
-private val WAKE_PHRASES = listOf(
-    "привет нурай",
-    "привет нур ай",
-    "нурай привет",
-    "нур ай привет"
-)
-
-internal fun containsNurAiWakePhrase(text: String): Boolean {
-    val normalized = text
-        .lowercase(Locale.forLanguageTag("ru"))
-        .replace('ё', 'е')
-        .replace(Regex("""[^\p{L}\p{N}]+"""), " ")
-        .trim()
-        .replace(Regex("""\s+"""), " ")
-    return WAKE_PHRASES.any(normalized::contains)
-}
+private enum class ListeningMode { OFF, CONVERSATION }
 
 class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     private var state by mutableStateOf(AssistantState.IDLE)
@@ -125,13 +108,18 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     private var statusMessage by mutableStateOf("Готова слушать")
     private var inputLevel by mutableStateOf(0f)
     private var isVoiceSessionActive by mutableStateOf(false)
-    private var isWaitingForWakeWord by mutableStateOf(false)
+    private var isFaceVisible by mutableStateOf(false)
+    private val userNames = mutableMapOf<Int, String>()
+    private var currentTrackingId: Int? = null
+    private var isWaitingForName by mutableStateOf(false)
     private var conversationId = ""
     private var accumulatedSpeech = ""
     private var listeningMode = ListeningMode.OFF
     private var isActivityVisible = false
+    private var wasFaceVisible = false
     private var speechRecognizer: SpeechRecognizer? = null
     private var textToSpeech: TextToSpeech? = null
+    private var faceScanner: CameraFaceScanner? = null
     private var isTtsReady = false
     private var pendingSpeech: String? = null
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -142,15 +130,28 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-            if (granted) startWakeWordMode() else showError(
-                "Разрешите доступ к микрофону, чтобы фраза «Привет, Нурай» работала"
+            if (granted) startVoiceSession() else showError(
+                "Разрешите доступ к микрофону, чтобы я могла вас слышать"
             )
         }
 
+    @SuppressLint("UnsafeOptInUsageError")
+    @androidx.camera.core.ExperimentalGetImage
+    private val cameraPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (granted) {
+                faceScanner?.bind(null, this, this)
+            }
+        }
+
+    @SuppressLint("UnsafeOptInUsageError")
+    @androidx.camera.core.ExperimentalGetImage
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         textToSpeech = TextToSpeech(this, this)
+        faceScanner = CameraFaceScanner(this) { handleFacePresenceChanged(it) }
+
         setContent {
             MyTheme {
                 VoiceAssistantScreen(
@@ -158,9 +159,9 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                     transcript = transcript,
                     answer = answer,
                     statusMessage = statusMessage,
+                    isFaceVisible = isFaceVisible,
                     inputLevel = inputLevel,
                     isVoiceSessionActive = isVoiceSessionActive,
-                    isWaitingForWakeWord = isWaitingForWakeWord,
                     isConfigured = BuildConfig.DIFY_API_KEY.isNotBlank(),
                     onVoiceTap = ::handleVoiceTap,
                     onSuggestion = ::sendQuestion,
@@ -169,30 +170,32 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                 )
             }
         }
-        if (savedInstanceState == null &&
-            checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED
-        ) {
-            mainHandler.post {
-                permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-            }
+
+        if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+            faceScanner?.bind(null, this, this)
+        } else {
+            cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+        }
+
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
         }
     }
 
     private fun handleVoiceTap() {
-        when {
-            checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
-                PackageManager.PERMISSION_GRANTED -> {
-                permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-            }
-            listeningMode == ListeningMode.CONVERSATION -> stopVoiceSession()
-            listeningMode == ListeningMode.WAKE_WORD -> activateFromWakeWord()
-            else -> startWakeWordMode()
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        } else if (listeningMode == ListeningMode.OFF) {
+            startVoiceSession()
+        } else {
+            stopVoiceSession()
         }
     }
 
     private fun startVoiceSession() {
         listeningMode = ListeningMode.CONVERSATION
-        isWaitingForWakeWord = false
         isVoiceSessionActive = true
         accumulatedSpeech = ""
         transcript = ""
@@ -200,34 +203,26 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         startListening()
     }
 
-    private fun startWakeWordMode(clearConversation: Boolean = false) {
-        listeningMode = ListeningMode.WAKE_WORD
-        isWaitingForWakeWord = true
-        isVoiceSessionActive = false
-        accumulatedSpeech = ""
-        inputLevel = 0f
-        if (clearConversation) {
-            transcript = ""
-            answer = ""
+    private fun handleFacePresenceChanged(trackingId: Int?) {
+        android.util.Log.d("NurAI", "Face detected: $trackingId")
+        isFaceVisible = trackingId != null
+        if (trackingId == null) {
+            currentTrackingId = null
+            wasFaceVisible = false
+            return
         }
-        state = AssistantState.LISTENING
-        statusMessage = "Скажите: «Привет, Нурай»"
-        if (isActivityVisible) startListening()
-    }
+        
+        if (trackingId == currentTrackingId) return
+        currentTrackingId = trackingId
+        wasFaceVisible = true
 
-    private fun activateFromWakeWord() {
-        if (listeningMode != ListeningMode.WAKE_WORD) return
-        mainHandler.removeCallbacks(restartListeningRunnable)
-        speechRecognizer?.cancel()
-        speechRecognizer?.destroy()
-        speechRecognizer = null
-        listeningMode = ListeningMode.CONVERSATION
-        isWaitingForWakeWord = false
-        isVoiceSessionActive = true
-        accumulatedSpeech = ""
-        transcript = ""
-        answer = WAKE_GREETING
-        speak(WAKE_GREETING)
+        val name = userNames[trackingId]
+        if (name == null) {
+            isWaitingForName = true
+            speak("Здравствуйте! Как мне вас называть?")
+        } else {
+            speak("Здравствуйте, $name! Рада вас видеть.")
+        }
     }
 
     private fun stopVoiceSession() {
@@ -238,15 +233,14 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         speechRecognizer?.cancel()
         speechRecognizer?.destroy()
         speechRecognizer = null
-        textToSpeech?.stop()
-        startWakeWordMode()
+        runCatching { textToSpeech?.stop() }
+        startVoiceSession()
     }
 
     private fun startListening() {
         if (!shouldKeepListening()) return
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
             listeningMode = ListeningMode.OFF
-            isWaitingForWakeWord = false
             isVoiceSessionActive = false
             showError("Распознавание речи недоступно на устройстве")
             return
@@ -259,12 +253,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                 override fun onReadyForSpeech(params: Bundle?) {
                     if (recognitionMode != listeningMode) return
                     state = AssistantState.LISTENING
-                    statusMessage = when {
-                        listeningMode == ListeningMode.WAKE_WORD ->
-                            "Скажите: «Привет, Нурай»"
-                        accumulatedSpeech.isBlank() -> "Слушаю вас…"
-                        else -> "Можете продолжить…"
-                    }
+                    statusMessage = if (accumulatedSpeech.isBlank()) "Слушаю вас…" else "Можете продолжить…"
                     inputLevel = 0f
                 }
 
@@ -279,11 +268,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                     inputLevel = 0f
                     if (shouldKeepListening()) {
                         state = AssistantState.LISTENING
-                        statusMessage = if (listeningMode == ListeningMode.WAKE_WORD) {
-                            "Жду фразу «Привет, Нурай»"
-                        } else {
-                            "Жду продолжение…"
-                        }
+                        statusMessage = "Слушаю вас…"
                     }
                 }
 
@@ -294,25 +279,15 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                     when (error) {
                         SpeechRecognizer.ERROR_NO_MATCH,
                         SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> {
-                            if (listeningMode == ListeningMode.WAKE_WORD) {
-                                statusMessage = "Скажите: «Привет, Нурай»"
-                                scheduleListeningRestart(250L)
-                            } else if (accumulatedSpeech.isNotBlank()) {
-                                scheduleQuestionSubmission()
-                            }
-                            else {
-                                statusMessage = "Жду ваш вопрос…"
-                                scheduleListeningRestart(350L)
-                            }
+                            statusMessage = "Слушаю..."
+                            scheduleListeningRestart(100L)
                         }
                         SpeechRecognizer.ERROR_NETWORK,
                         SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> {
-                            statusMessage = "Ошибка распознавания. Повторяю…"
-                            scheduleListeningRestart(1_000L)
-                        }
-                        SpeechRecognizer.ERROR_RECOGNIZER_BUSY ->
+                            statusMessage = "Ошибка сети. Повторяю…"
                             scheduleListeningRestart(500L)
-                        else -> scheduleListeningRestart(500L)
+                        }
+                        else -> scheduleListeningRestart(200L)
                     }
                 }
 
@@ -321,16 +296,17 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                     val candidates = results
                         ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                         .orEmpty()
-                    if (listeningMode == ListeningMode.WAKE_WORD) {
-                        if (candidates.any(::containsNurAiWakePhrase)) {
-                            activateFromWakeWord()
-                        } else {
-                            scheduleListeningRestart(200L)
-                        }
-                        return
-                    }
+                    
                     val text = candidates.firstOrNull().orEmpty()
                     if (text.isNotBlank()) {
+                        if (isWaitingForName) {
+                            currentTrackingId?.let { id -> userNames[id] = text }
+                            isWaitingForName = false
+                            speak("Очень приятно, $text! Чем я могу вам помочь?")
+                            transcript = text
+                            return
+                        }
+                        
                         accumulatedSpeech = listOf(accumulatedSpeech, text)
                             .filter(String::isNotBlank)
                             .joinToString(" ")
@@ -347,10 +323,6 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                         ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                         ?.firstOrNull()
                         .orEmpty()
-                    if (listeningMode == ListeningMode.WAKE_WORD) {
-                        if (containsNurAiWakePhrase(partial)) activateFromWakeWord()
-                        return
-                    }
                     transcript = listOf(accumulatedSpeech, partial)
                         .filter(String::isNotBlank)
                         .joinToString(" ")
@@ -406,7 +378,6 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     private fun sendQuestion(question: String) {
         if (listeningMode != ListeningMode.CONVERSATION) {
             listeningMode = ListeningMode.CONVERSATION
-            isWaitingForWakeWord = false
             isVoiceSessionActive = true
             speechRecognizer?.cancel()
             speechRecognizer?.destroy()
@@ -460,24 +431,25 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         val speechParams = Bundle().apply {
             putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1f)
         }
-        val result = textToSpeech?.speak(
-            spokenText,
-            TextToSpeech.QUEUE_FLUSH,
-            speechParams,
-            "dify-answer"
-        )
-        if (result == TextToSpeech.ERROR) {
+        runCatching {
+            textToSpeech?.speak(
+                spokenText,
+                TextToSpeech.QUEUE_FLUSH,
+                speechParams,
+                "dify-answer"
+            )
+        }.onFailure {
             state = AssistantState.IDLE
-            statusMessage = "Не удалось включить озвучивание"
+            statusMessage = "Сбой синтеза речи"
         }
     }
 
     private fun stopSpeaking() {
-        textToSpeech?.stop()
+        runCatching { textToSpeech?.stop() }
         if (isVoiceSessionActive) {
             state = AssistantState.LISTENING
-            statusMessage = "Слушаю следующий вопрос…"
-            mainHandler.postDelayed({ startListening() }, 250L)
+            statusMessage = "Слушаю вас…"
+            mainHandler.postDelayed({ startListening() }, 100L)
         } else {
             state = AssistantState.IDLE
             statusMessage = "Озвучивание остановлено"
@@ -495,19 +467,17 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         }, 3_000)
     }
 
-    private fun shouldKeepListening(): Boolean =
-        isActivityVisible && listeningMode != ListeningMode.OFF
+    private fun shouldKeepListening(): Boolean = isActivityVisible
 
     override fun onStart() {
         super.onStart()
         isActivityVisible = true
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
-            when (listeningMode) {
-                ListeningMode.OFF -> startWakeWordMode()
-                ListeningMode.WAKE_WORD, ListeningMode.CONVERSATION -> {
-                    state = AssistantState.LISTENING
-                    scheduleListeningRestart(150L)
-                }
+            if (listeningMode == ListeningMode.OFF) {
+                startVoiceSession()
+            } else {
+                state = AssistantState.LISTENING
+                scheduleListeningRestart(150L)
             }
         }
     }
@@ -526,34 +496,40 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
             val engine = textToSpeech ?: return
-            val languageResult = engine.setLanguage(Locale.forLanguageTag("ru-RU"))
-            if (languageResult == TextToSpeech.LANG_MISSING_DATA ||
-                languageResult == TextToSpeech.LANG_NOT_SUPPORTED
-            ) {
-                engine.language = Locale.forLanguageTag("ru")
+            
+            // Устанавливаем русский язык
+            engine.language = Locale("ru", "RU")
+
+            // Ищем именно женский голос среди всех установленных
+            val femaleVoice = engine.voices?.find { voice ->
+                val name = voice.name.lowercase()
+                // Проверяем по всем возможным признакам женского голоса в Android
+                name.contains("female") || 
+                name.contains("network-f") || 
+                name.contains("-f-") || 
+                name.contains("ru-ru-x-dfc") || // Популярный женский голос Google
+                name.contains("ru-ru-x-ruc-local") ||
+                voice.features.contains("female")
             }
-            engine.voices
-                ?.filter { it.locale.language == "ru" && !it.isNetworkConnectionRequired }
-                ?.sortedByDescending { voice ->
-                    val name = voice.name.lowercase()
-                    when {
-                        "ruf" in name || "female" in name -> 3
-                        "local" in name || "embedded" in name -> 2
-                        else -> 1
-                    }
-                }
-                ?.firstOrNull()
-                ?.let { engine.voice = it }
-            engine.setSpeechRate(0.94f)
-            engine.setPitch(1.12f)
+
+            if (femaleVoice != null) {
+                engine.voice = femaleVoice
+            }
+
+            // Накручиваем настройки тембра для 100% женского звучания
+            engine.setPitch(1.35f) // Делаем голос значительно выше
+            engine.setSpeechRate(1.05f) // Скорость чуть выше среднего для естественности
+            
             engine.setAudioAttributes(
                 AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build()
             )
+
             textToSpeech?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(utteranceId: String?) = Unit
+                @Suppress("DeprecatedCallableAddReplaceWith")
                 override fun onError(utteranceId: String?) {
                     mainHandler.post {
                         state = AssistantState.IDLE
@@ -564,14 +540,9 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                 override fun onDone(utteranceId: String?) {
                     mainHandler.post {
                         if (state == AssistantState.SPEAKING) {
-                            if (isVoiceSessionActive) {
-                                state = AssistantState.LISTENING
-                                statusMessage = "Слушаю следующий вопрос…"
-                                mainHandler.postDelayed({ startListening() }, 350L)
-                            } else {
-                                state = AssistantState.IDLE
-                                statusMessage = "Можно спросить ещё"
-                            }
+                            state = AssistantState.LISTENING
+                            statusMessage = "Слушаю вас…"
+                            mainHandler.postDelayed({ startListening() }, 100L)
                         }
                     }
                 }
@@ -710,14 +681,15 @@ private object DifyClient {
 }
 
 @Composable
+@SuppressLint("UnsafeOptInUsageError")
 private fun VoiceAssistantScreen(
     state: AssistantState,
     transcript: String,
     answer: String,
     statusMessage: String,
+    isFaceVisible: Boolean,
     inputLevel: Float,
     isVoiceSessionActive: Boolean,
-    isWaitingForWakeWord: Boolean,
     isConfigured: Boolean,
     onVoiceTap: () -> Unit,
     onSuggestion: (String) -> Unit,
@@ -745,11 +717,11 @@ private fun VoiceAssistantScreen(
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Header(isConfigured)
+            Spacer(Modifier.height(32.dp))
             Spacer(Modifier.weight(0.8f))
             Text(
                 text = when (state) {
-                    AssistantState.LISTENING ->
-                        if (isWaitingForWakeWord) "Позовите меня" else "Я слушаю"
+                    AssistantState.LISTENING -> "Я слушаю"
                     AssistantState.THINKING -> "Секунду…"
                     AssistantState.SPEAKING ->
                         if (transcript.isBlank()) "Здравствуйте" else "Вот что я нашла"
@@ -791,12 +763,10 @@ private fun VoiceAssistantScreen(
             }
             Spacer(Modifier.height(14.dp))
             Text(
-                text = when {
-                    isVoiceSessionActive ->
-                        "Голосовой режим включён · нажмите сферу, чтобы ждать фразу снова"
-                    isWaitingForWakeWord ->
-                        "Я жду фразу «Привет, Нурай» · сферу тоже можно нажать"
-                    else -> "Нажмите на сферу, чтобы включить голосовой режим"
+                text = if (isVoiceSessionActive) {
+                    "Голосовой режим включён · нажмите сферу, чтобы перезагрузить"
+                } else {
+                    "Нажмите на сферу, чтобы включить голосовой режим"
                 },
                 color = AuraTextMuted,
                 style = MaterialTheme.typography.bodyMedium,
@@ -1169,9 +1139,9 @@ private fun VoiceAssistantPreview() {
             transcript = "",
             answer = "",
             statusMessage = "Готова слушать",
+            isFaceVisible = false,
             inputLevel = 0f,
             isVoiceSessionActive = false,
-            isWaitingForWakeWord = true,
             isConfigured = false,
             onVoiceTap = {},
             onSuggestion = {},
