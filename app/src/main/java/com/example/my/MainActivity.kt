@@ -206,22 +206,32 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     private fun handleFacePresenceChanged(trackingId: Int?) {
         android.util.Log.d("NurAI", "Face detected: $trackingId")
         isFaceVisible = trackingId != null
+        
         if (trackingId == null) {
             currentTrackingId = null
             wasFaceVisible = false
             return
         }
         
-        if (trackingId == currentTrackingId) return
+        // Если это тот же самый человек, которого мы уже видим, ничего не делаем
+        if (trackingId == currentTrackingId && wasFaceVisible) return
+        
         currentTrackingId = trackingId
         wasFaceVisible = true
 
-        val name = userNames[trackingId]
-        if (name == null) {
-            isWaitingForName = true
-            speak("Здравствуйте! Как мне вас называть?")
-        } else {
-            speak("Здравствуйте, $name! Рада вас видеть.")
+        // Мгновенная реакция
+        mainHandler.post {
+            // Если мы уже говорим или думаем, не перебиваем (опционально)
+            // Но по запросу "сразу поздоровается" — прерываем всё и приветствуем
+            stopSpeaking() 
+            
+            val name = userNames[trackingId]
+            if (name == null) {
+                isWaitingForName = true
+                speak("Здравствуйте! Я вас вижу. Как мне к вам обращаться?")
+            } else {
+                speak("Здравствуйте, $name! Рада вас снова видеть. Чем могу помочь?")
+            }
         }
     }
 
