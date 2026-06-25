@@ -23,6 +23,8 @@ import androidx.compose.animation.Crossfade
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.StartOffset
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
@@ -110,6 +112,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     private var isVoiceSessionActive by mutableStateOf(false)
     private var isFaceVisible by mutableStateOf(false)
     private val userNames = mutableMapOf<Int, String>()
+    private val userHistory = mutableMapOf<Int, String>() // История тем для каждого пользователя
     private var currentTrackingId: Int? = null
     private var isWaitingForName by mutableStateOf(false)
     private var conversationId = ""
@@ -216,15 +219,13 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         // Если это тот же самый человек, которого мы уже видим, ничего не делаем
         if (trackingId == currentTrackingId && wasFaceVisible) return
         
+        // ВАЖНО: Если мы сейчас ГОВОРИМ или ДУМАЕМ, не перебиваем приветствием
+        if (state == AssistantState.SPEAKING || state == AssistantState.THINKING) return
+        
         currentTrackingId = trackingId
         wasFaceVisible = true
 
-        // Мгновенная реакция
         mainHandler.post {
-            // Если мы уже говорим или думаем, не перебиваем (опционально)
-            // Но по запросу "сразу поздоровается" — прерываем всё и приветствуем
-            stopSpeaking() 
-            
             val name = userNames[trackingId]
             if (name == null) {
                 isWaitingForName = true
@@ -240,15 +241,20 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         mainHandler.removeCallbacks(restartListeningRunnable)
         accumulatedSpeech = ""
         inputLevel = 0f
-        speechRecognizer?.cancel()
-        speechRecognizer?.destroy()
-        speechRecognizer = null
+        stopCurrentListening()
         runCatching { textToSpeech?.stop() }
         startVoiceSession()
     }
 
     private fun startListening() {
         if (!shouldKeepListening()) return
+        
+        // СТРОГАЯ ПРОВЕРКА: Если робот думает или говорит, микрофон НЕ включается
+        if (state == AssistantState.THINKING || state == AssistantState.SPEAKING) {
+            android.util.Log.d("NurAI", "Пропуск startListening: робот занят (state=$state)")
+            return
+        }
+        
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
             listeningMode = ListeningMode.OFF
             isVoiceSessionActive = false
@@ -263,7 +269,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                 override fun onReadyForSpeech(params: Bundle?) {
                     if (recognitionMode != listeningMode) return
                     state = AssistantState.LISTENING
-                    statusMessage = if (accumulatedSpeech.isBlank()) "Слушаю вас…" else "Можете продолжить…"
+                    statusMessage = if (accumulatedSpeech.isBlank()) "Слушаю вас (RU/KG)…" else "Можете продолжить…"
                     inputLevel = 0f
                 }
 
@@ -322,9 +328,13 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                             .joinToString(" ")
                             .trim()
                         transcript = accumulatedSpeech
+                        
+                        // Если получили текст, планируем отправку и НЕ перезапускаем прослушивание сразу
                         scheduleQuestionSubmission()
+                    } else {
+                        // Если текста нет, можно попробовать слушать дальше
+                        scheduleListeningRestart(300L)
                     }
-                    scheduleListeningRestart(250L)
                 }
 
                 override fun onPartialResults(partialResults: Bundle?) {
@@ -342,23 +352,20 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
             })
             startListening(
                 Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                    putExtra(
-                        RecognizerIntent.EXTRA_LANGUAGE_MODEL,
-                        RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
-                    )
+                    putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                     putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ru-RU")
-                    putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "ru-RU")
+                    putExtra(RecognizerIntent.EXTRA_SUPPORTED_LANGUAGES, arrayListOf("ru-RU", "ky-KG"))
                     putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
                     putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
-                    putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false)
-                    putExtra(
-                        RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS,
-                        1_000L
-                    )
-                    putExtra(
-                        RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS,
-                        900L
-                    )
+                    
+                    // УЛЬТРА-НАСТРОЙКИ ЧУВСТВИТЕЛЬНОСТИ
+                    // Уменьшаем время ожидания, чтобы реакция была мгновенной
+                    putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 600L)
+                    putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 600L)
+                    putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 500L)
+                    
+                    // Повышаем точность за счет подавления эха (на системном уровне)
+                    putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, android.media.MediaRecorder.AudioSource.VOICE_RECOGNITION)
                 }
             )
         }
@@ -370,6 +377,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     }
 
     private fun scheduleListeningRestart(delay: Long) {
+        if (state == AssistantState.THINKING || state == AssistantState.SPEAKING) return
         mainHandler.removeCallbacks(restartListeningRunnable)
         mainHandler.postDelayed(restartListeningRunnable, delay)
     }
@@ -414,6 +422,12 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                     mainHandler.post {
                         conversationId = result.conversationId
                         answer = result.answer
+                        
+                        // Сохраняем краткий контекст в память пользователя
+                        currentTrackingId?.let { id ->
+                            userHistory[id] = result.answer.take(50) + "..."
+                        }
+
                         speak(result.answer)
                     }
                 }
@@ -426,40 +440,75 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     }
 
     private fun speak(text: String) {
-        if (!isTtsReady) {
-            pendingSpeech = text
-            state = AssistantState.SPEAKING
-            statusMessage = "Подготавливаю голос…"
-            return
+        if (text.isBlank()) return
+        
+        stopCurrentListening()
+        
+        // Определяем язык ответа для синтезатора
+        val isKyrgyz = text.any { it in 'Ө'..'ө' || it in 'Ң'..'ң' || it in 'Ү'..'ү' }
+        if (isKyrgyz) {
+            textToSpeech?.language = Locale("ky", "KG")
+        } else {
+            textToSpeech?.language = Locale("ru", "RU")
         }
+
         state = AssistantState.SPEAKING
         statusMessage = "Отвечаю…"
         val spokenText = text
             .replace(Regex("""https?://\S+"""), "Ссылка указана на экране.")
             .replace(Regex("""[*_#`]"""), "")
             .replace("•", "")
+            
         val speechParams = Bundle().apply {
-            putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1f)
+            putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
+            putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, "dify-answer")
+            // Принудительно направляем в динамик
+            putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, android.media.AudioManager.STREAM_MUSIC)
         }
+        
+        if (isTtsReady) {
+            runCatching {
+                textToSpeech?.speak(
+                    spokenText,
+                    TextToSpeech.QUEUE_FLUSH,
+                    speechParams,
+                    "dify-answer"
+                )
+            }.onFailure { e ->
+                android.util.Log.e("NurAI", "TTS Speak error", e)
+                state = AssistantState.IDLE
+                statusMessage = "Сбой синтеза речи"
+                startListening()
+            }
+        } else {
+            pendingSpeech = text
+            statusMessage = "Инициализация голоса…"
+            // Если TTS не готов, попробуем пересоздать его
+            initTts()
+        }
+    }
+
+    private fun initTts() {
+        textToSpeech?.shutdown()
+        textToSpeech = TextToSpeech(this, this)
+    }
+
+    private fun stopCurrentListening() {
+        mainHandler.removeCallbacks(restartListeningRunnable)
+        mainHandler.removeCallbacks(submitSpeechRunnable)
         runCatching {
-            textToSpeech?.speak(
-                spokenText,
-                TextToSpeech.QUEUE_FLUSH,
-                speechParams,
-                "dify-answer"
-            )
-        }.onFailure {
-            state = AssistantState.IDLE
-            statusMessage = "Сбой синтеза речи"
+            speechRecognizer?.cancel()
+            speechRecognizer?.destroy()
         }
+        speechRecognizer = null
     }
 
     private fun stopSpeaking() {
         runCatching { textToSpeech?.stop() }
         if (isVoiceSessionActive) {
-            state = AssistantState.LISTENING
+            state = AssistantState.IDLE
             statusMessage = "Слушаю вас…"
-            mainHandler.postDelayed({ startListening() }, 100L)
+            startListening()
         } else {
             state = AssistantState.IDLE
             statusMessage = "Озвучивание остановлено"
@@ -507,36 +556,21 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         if (status == TextToSpeech.SUCCESS) {
             val engine = textToSpeech ?: return
             
-            // Устанавливаем русский язык
-            engine.language = Locale("ru", "RU")
+            // ПРИНУДИТЕЛЬНО РУССКИЙ
+            engine.setLanguage(Locale("ru", "RU"))
 
-            // Ищем именно женский голос среди всех установленных
-            val femaleVoice = engine.voices?.find { voice ->
-                val name = voice.name.lowercase()
-                // Проверяем по всем возможным признакам женского голоса в Android
-                name.contains("female") || 
-                name.contains("network-f") || 
-                name.contains("-f-") || 
-                name.contains("ru-ru-x-dfc") || // Популярный женский голос Google
-                name.contains("ru-ru-x-ruc-local") ||
-                voice.features.contains("female")
-            }
+            // Пытаемся найти ЛЮБОЙ женский голос
+            val voices = engine.voices
+            val femaleVoice = voices?.find { it.name.lowercase().contains("female") || it.name.lowercase().contains("-f-") } 
+                ?: voices?.firstOrNull { it.locale.language == "ru" }
 
             if (femaleVoice != null) {
                 engine.voice = femaleVoice
             }
 
-            // Накручиваем настройки тембра для 100% женского звучания
-            engine.setPitch(1.35f) // Делаем голос значительно выше
-            engine.setSpeechRate(1.05f) // Скорость чуть выше среднего для естественности
+            engine.setPitch(1.3f) 
+            engine.setSpeechRate(1.0f) 
             
-            engine.setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build()
-            )
-
             textToSpeech?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(utteranceId: String?) = Unit
                 @Suppress("DeprecatedCallableAddReplaceWith")
@@ -550,9 +584,10 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                 override fun onDone(utteranceId: String?) {
                     mainHandler.post {
                         if (state == AssistantState.SPEAKING) {
-                            state = AssistantState.LISTENING
-                            statusMessage = "Слушаю вас…"
-                            mainHandler.postDelayed({ startListening() }, 100L)
+                            state = AssistantState.IDLE
+                            statusMessage = "Я закончила, слушаю вас…"
+                            // Включаем микрофон СРАЗУ ПОСЛЕ того, как робот замолчал
+                            startListening()
                         }
                     }
                 }
@@ -865,36 +900,30 @@ private fun BoxScope.AmbientGlow(state: AssistantState) {
 
 @Composable
 private fun VoiceOrb(state: AssistantState, inputLevel: Float, onClick: () -> Unit) {
-    val transition = rememberInfiniteTransition(label = "robotFace")
+    val transition = rememberInfiniteTransition(label = "orb")
     val interactionSource = remember { MutableInteractionSource() }
-    val pulse by transition.animateFloat(
-        initialValue = 0f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(tween(620), RepeatMode.Reverse),
-        label = "facePulse"
+    
+    // Плавная анимация уровня звука
+    val animatedLevel by animateFloatAsState(
+        targetValue = inputLevel,
+        animationSpec = tween<Float>(150),
+        label = "level"
     )
-    val blink by transition.animateFloat(
-        initialValue = 1f,
-        targetValue = 0.82f,
-        animationSpec = infiniteRepeatable(tween(1_800), RepeatMode.Reverse),
-        label = "blink"
+
+    val orbColor by animateColorAsState(
+        when (state) {
+            AssistantState.ERROR -> Color(0xFFFF8B82)
+            AssistantState.THINKING -> AuraCyan
+            AssistantState.SPEAKING -> AuraMint
+            else -> if (inputLevel > 0.1f) AuraCyan else AuraMint
+        },
+        label = "color"
     )
-    val accent = when (state) {
-        AssistantState.ERROR -> Color(0xFFFF8B82)
-        AssistantState.THINKING -> AuraCyan
-        else -> AuraMint
-    }
+
     Box(
         modifier = Modifier
-            .size(width = 226.dp, height = 166.dp)
-            .scale(
-                if (state == AssistantState.LISTENING) {
-                    1f + inputLevel * 0.045f
-                } else {
-                    1f
-                }
-            )
-            .semantics { contentDescription = "Лицо и кнопка голосового ассистента NurAI" }
+            .size(width = 240.dp, height = 240.dp)
+            .scale(1f + animatedLevel * 0.2f)
             .clickable(
                 interactionSource = interactionSource,
                 indication = null,
@@ -902,147 +931,109 @@ private fun VoiceOrb(state: AssistantState, inputLevel: Float, onClick: () -> Un
             ),
         contentAlignment = Alignment.Center
     ) {
+        // Фоновое свечение (VFX)
+        repeat(3) { index ->
+            val pulseScale by transition.animateFloat(
+                initialValue = 1f,
+                targetValue = 1.2f + (index * 0.2f),
+                animationSpec = infiniteRepeatable(
+                    animation = tween(2000 + index * 500),
+                    repeatMode = RepeatMode.Reverse
+                ),
+                label = "pulse"
+            )
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .scale(pulseScale + animatedLevel * 0.5f)
+                    .alpha(0.1f / (index + 1))
+                    .background(orbColor, CircleShape)
+                    .blur(40.dp)
+            )
+        }
+
+        // Основная "живая" сфера
         Box(
             Modifier
-                .fillMaxSize()
+                .size(160.dp)
                 .background(
                     Brush.radialGradient(
-                        listOf(accent.copy(alpha = 0.20f), AuraSurfaceHigh, AuraBackground)
+                        colors = listOf(orbColor, AuraSurfaceHigh, AuraBackground)
                     ),
-                    RoundedCornerShape(52.dp)
+                    CircleShape
                 )
                 .border(
-                    2.dp,
+                    (2.dp + (animatedLevel * 4).dp),
                     Brush.linearGradient(
-                        listOf(accent.copy(alpha = 0.95f), AuraCyan.copy(alpha = 0.35f))
+                        listOf(orbColor, AuraCyan.copy(alpha = 0.5f))
                     ),
-                    RoundedCornerShape(52.dp)
+                    CircleShape
                 ),
             contentAlignment = Alignment.Center
         ) {
-            RobotFace(state, accent, inputLevel, pulse, blink)
+            // Эффект "энергии" внутри
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                val center = Offset(size.width / 2, size.height / 2)
+                val radius = size.minDimension / 2
+                
+                for (i in 0 until 360 step 15) {
+                    val angle = Math.toRadians(i.toDouble())
+                    val lineLen = radius * (0.1f + animatedLevel * 0.4f)
+                    val start = Offset(
+                        (center.x + (radius - lineLen) * Math.cos(angle)).toFloat(),
+                        (center.y + (radius - lineLen) * Math.sin(angle)).toFloat()
+                    )
+                    val end = Offset(
+                        (center.x + radius * Math.cos(angle)).toFloat(),
+                        (center.y + radius * Math.sin(angle)).toFloat()
+                    )
+                    drawLine(
+                        color = orbColor.copy(alpha = 0.6f),
+                        start = start,
+                        end = end,
+                        strokeWidth = 2.dp.toPx(),
+                        cap = StrokeCap.Round
+                    )
+                }
+            }
+            
+            // Глаза робота (уменьшенные внутри сферы)
+            RobotEyes(state, orbColor, inputLevel)
         }
     }
 }
 
 @Composable
-private fun RobotFace(
-    state: AssistantState,
-    color: Color,
-    inputLevel: Float,
-    pulse: Float,
-    blink: Float
-) {
-    Canvas(Modifier.size(width = 166.dp, height = 108.dp)) {
-        val eyeY = size.height * 0.38f
-        val leftX = size.width * 0.30f
-        val rightX = size.width * 0.70f
-        val stroke = 5.dp.toPx()
-        val glow = color.copy(alpha = 0.20f)
+private fun RobotEyes(state: AssistantState, color: Color, inputLevel: Float) {
+    val transition = rememberInfiniteTransition(label = "eyes")
+    val blink by transition.animateFloat(
+        initialValue = 1f,
+        targetValue = 0.1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(150),
+            repeatMode = RepeatMode.Reverse,
+            initialStartOffset = StartOffset(2000)
+        ),
+        label = "blink"
+    )
 
-        drawCircle(glow, 19.dp.toPx(), Offset(leftX, eyeY))
-        drawCircle(glow, 19.dp.toPx(), Offset(rightX, eyeY))
-
-        when (state) {
-            AssistantState.IDLE -> {
-                drawArc(
-                    color, 10f, 160f, false,
-                    Offset(leftX - 15.dp.toPx(), eyeY - 8.dp.toPx()),
-                    Size(30.dp.toPx(), 18.dp.toPx()),
-                    style = Stroke(stroke, cap = StrokeCap.Round)
-                )
-                drawArc(
-                    color, 10f, 160f, false,
-                    Offset(rightX - 15.dp.toPx(), eyeY - 8.dp.toPx()),
-                    Size(30.dp.toPx(), 18.dp.toPx()),
-                    style = Stroke(stroke, cap = StrokeCap.Round)
-                )
-            }
-            AssistantState.LISTENING -> {
-                val radius = (8f + inputLevel * 4f).dp.toPx()
-                drawOval(
-                    color,
-                    Offset(leftX - radius, eyeY - radius * blink),
-                    Size(radius * 2f, radius * 2f * blink)
-                )
-                drawOval(
-                    color,
-                    Offset(rightX - radius, eyeY - radius * blink),
-                    Size(radius * 2f, radius * 2f * blink)
-                )
-            }
-            AssistantState.THINKING -> {
-                drawCircle(color, 8.dp.toPx(), Offset(leftX, eyeY))
-                drawLine(
-                    color,
-                    Offset(rightX - 12.dp.toPx(), eyeY),
-                    Offset(rightX + 12.dp.toPx(), eyeY),
-                    stroke,
-                    StrokeCap.Round
-                )
-            }
-            AssistantState.SPEAKING -> {
-                drawArc(
-                    color, 10f, 160f, false,
-                    Offset(leftX - 14.dp.toPx(), eyeY - 7.dp.toPx()),
-                    Size(28.dp.toPx(), 16.dp.toPx()),
-                    style = Stroke(stroke, cap = StrokeCap.Round)
-                )
-                drawArc(
-                    color, 10f, 160f, false,
-                    Offset(rightX - 14.dp.toPx(), eyeY - 7.dp.toPx()),
-                    Size(28.dp.toPx(), 16.dp.toPx()),
-                    style = Stroke(stroke, cap = StrokeCap.Round)
-                )
-            }
-            AssistantState.ERROR -> {
-                drawLine(
-                    color,
-                    Offset(leftX - 11.dp.toPx(), eyeY - 6.dp.toPx()),
-                    Offset(leftX + 11.dp.toPx(), eyeY + 5.dp.toPx()),
-                    stroke,
-                    StrokeCap.Round
-                )
-                drawLine(
-                    color,
-                    Offset(rightX - 11.dp.toPx(), eyeY + 5.dp.toPx()),
-                    Offset(rightX + 11.dp.toPx(), eyeY - 6.dp.toPx()),
-                    stroke,
-                    StrokeCap.Round
-                )
-            }
-        }
-
-        val mouthY = size.height * 0.72f
-        when (state) {
-            AssistantState.THINKING -> repeat(3) { index ->
-                drawCircle(
-                    color.copy(alpha = 0.45f + index * 0.25f),
-                    (3f + index).dp.toPx(),
-                    Offset(size.width * (0.42f + index * 0.08f), mouthY)
-                )
-            }
-            AssistantState.SPEAKING -> {
-                val mouthHeight = (12f + pulse * 12f).dp.toPx()
-                drawOval(
-                    color,
-                    Offset(size.width * 0.39f, mouthY - mouthHeight / 2f),
-                    Size(size.width * 0.22f, mouthHeight)
-                )
-            }
-            AssistantState.ERROR -> drawArc(
-                color, 195f, 150f, false,
-                Offset(size.width * 0.39f, mouthY - 2.dp.toPx()),
-                Size(size.width * 0.22f, 18.dp.toPx()),
-                style = Stroke(stroke, cap = StrokeCap.Round)
-            )
-            else -> drawArc(
-                color, 20f, 140f, false,
-                Offset(size.width * 0.37f, mouthY - 12.dp.toPx()),
-                Size(size.width * 0.26f, 25.dp.toPx()),
-                style = Stroke(stroke, cap = StrokeCap.Round)
-            )
-        }
+    Canvas(Modifier.size(80.dp, 40.dp)) {
+        val eyeWidth = 12.dp.toPx()
+        val eyeHeight = 12.dp.toPx()
+        val spacing = 30.dp.toPx()
+        
+        // Левый глаз
+        drawOval(
+            color = color,
+            topLeft = Offset(center.x - spacing / 2 - eyeWidth / 2, center.y - (eyeHeight * blink) / 2),
+            size = Size(eyeWidth, eyeHeight * if (state == AssistantState.IDLE) blink else 1f)
+        )
+        // Правый глаз
+        drawOval(
+            color = color,
+            topLeft = Offset(center.x + spacing / 2 - eyeWidth / 2, center.y - (eyeHeight * blink) / 2),
+            size = Size(eyeWidth, eyeHeight * if (state == AssistantState.IDLE) blink else 1f)
+        )
     }
 }
 
