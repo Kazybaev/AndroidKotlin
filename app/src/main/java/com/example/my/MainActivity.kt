@@ -265,7 +265,16 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                 putExtra(RecognizerIntent.EXTRA_SUPPORTED_LANGUAGES, arrayListOf("ru-RU", "ky-KG"))
                 putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
                 putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+                
+                // УЛЬТРА-ТОЧНЫЕ НАСТРОЙКИ СЛУШАНИЯ
                 putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 600L)
+                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 600L)
+                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 1000L)
+                
+                // Включаем подавление шумов и оптимизацию под диктовку
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                    putExtra(RecognizerIntent.EXTRA_MASK_OFFENSIVE_WORDS, false)
+                }
             })
         }
     }
@@ -315,7 +324,15 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         if (text.isBlank()) return
         stopCurrentListening()
         
-        val isKyrgyz = text.any { it in 'Ө'..'ө' || it in 'Ң'..'ң' || it in 'Ү'..'ү' }
+        // Очистка текста от Markdown и лишних символов для чистой речи
+        val cleanedText = text
+            .replace(Regex("""[*_#`~]"""), "") // Убираем спецсимволы
+            .replace(Regex("""https?://\S+"""), "ссылка указана на экране") // Заменяем ссылки
+            .replace(Regex("""\((.*?)\)"""), "") // Убираем текст в скобках (часто там пояснения)
+            .replace("—", "-")
+            .trim()
+
+        val isKyrgyz = cleanedText.any { it in 'Ө'..'ө' || it in 'Ң'..'ң' || it in 'Ү'..'ү' }
         textToSpeech?.language = if (isKyrgyz) Locale("ky", "KG") else Locale("ru", "RU")
 
         state = AssistantState.SPEAKING
@@ -328,13 +345,13 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         }
         
         if (isTtsReady) {
-            runCatching { textToSpeech?.speak(text, TextToSpeech.QUEUE_FLUSH, params, "answer") }
+            runCatching { textToSpeech?.speak(cleanedText, TextToSpeech.QUEUE_FLUSH, params, "answer") }
                 .onFailure { 
                     state = AssistantState.IDLE
                     startListening() 
                 }
         } else {
-            pendingSpeech = text
+            pendingSpeech = cleanedText
             initTts()
         }
     }
@@ -373,20 +390,53 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
             val engine = textToSpeech ?: return
-            engine.language = Locale("ru", "RU")
-            val femaleVoice = engine.voices?.find { it.name.lowercase().contains("female") || it.name.lowercase().contains("-f-") }
-            if (femaleVoice != null) engine.voice = femaleVoice
-            engine.setPitch(1.3f)
-            engine.setSpeechRate(1.0f)
+            
+            // Приоритизация самых качественных женских голосов
+            val voices = engine.voices
+            val bestVoice = voices?.asSequence()
+                ?.filter { it.locale.language == "ru" }
+                ?.sortedByDescending { voice ->
+                    val name = voice.name.lowercase()
+                    when {
+                        // Самые качественные голоса Google (Natural/Neural)
+                        "network" in name && ("-f-" in name || "female" in name) -> 100
+                        "ru-ru-x-dfc" in name -> 90 // Популярный чистый женский голос
+                        "ru-ru-x-ruc-local" in name -> 80
+                        "female" in name || "-f-" in name -> 70
+                        else -> 10
+                    }
+                }?.firstOrNull()
+
+            if (bestVoice != null) {
+                engine.voice = bestVoice
+                android.util.Log.d("NurAI", "Selected voice: ${bestVoice.name}")
+            }
+
+            engine.setPitch(1.25f) // Чуть естественнее, чем 1.3
+            engine.setSpeechRate(1.05f) // Живая, не монотонная речь
+            
             textToSpeech?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                override fun onStart(utteranceId: String?) = Unit
-                override fun onError(utteranceId: String?) { mainHandler.post { state = AssistantState.IDLE; startListening() } }
-                override fun onDone(utteranceId: String?) { mainHandler.post { state = AssistantState.IDLE; startListening() } }
+                override fun onStart(utteranceId: String?) {
+                    mainHandler.post { state = AssistantState.SPEAKING }
+                }
+                override fun onError(utteranceId: String?) { 
+                    mainHandler.post { 
+                        state = AssistantState.IDLE
+                        startListening() 
+                    } 
+                }
+                override fun onDone(utteranceId: String?) { 
+                    mainHandler.post { 
+                        state = AssistantState.IDLE
+                        startListening() 
+                    } 
+                }
             })
             isTtsReady = true
             pendingSpeech?.let { speak(it); pendingSpeech = null }
         } else {
             isTtsReady = false
+            showError("Синтезатор речи не готов")
         }
     }
 
@@ -399,29 +449,61 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
 
 private object DifyClient {
     data class Result(val answer: String, val conversationId: String)
+    
     fun ask(question: String, conversationId: String): Result {
         val baseUrl = BuildConfig.DIFY_BASE_URL.trimEnd('/').removeSuffix("/v1")
-        val endpoint = if (BuildConfig.DIFY_API_MODE == "workflow") "$baseUrl/v1/workflows/run" else "$baseUrl/v1/chat-messages"
+        val isWorkflow = BuildConfig.DIFY_API_MODE == "workflow"
+        val endpoint = if (isWorkflow) "$baseUrl/v1/workflows/run" else "$baseUrl/v1/chat-messages"
+        
         val connection = (URL(endpoint).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             connectTimeout = 15000
-            readTimeout = 45000
+            readTimeout = 60000 // Увеличиваем до минуты для сложных запросов
             doOutput = true
             setRequestProperty("Authorization", "Bearer ${BuildConfig.DIFY_API_KEY}")
             setRequestProperty("Content-Type", "application/json")
         }
+
         val body = JSONObject().apply {
-            put("inputs", if (BuildConfig.DIFY_API_MODE == "workflow") JSONObject().put("query", question) else JSONObject())
-            if (BuildConfig.DIFY_API_MODE != "workflow") put("query", question)
+            if (isWorkflow) {
+                put("inputs", JSONObject().apply {
+                    put("query", question)
+                    put("user_name", "Visitor")
+                })
+            } else {
+                put("query", question)
+            }
             put("response_mode", "blocking")
-            put("user", "user")
-            if (conversationId.isNotBlank()) put("conversation_id", conversationId)
+            put("user", "aura_robot_id_${android.os.Build.MODEL}") // Уникальный ID устройства
+            if (conversationId.isNotBlank() && !isWorkflow) {
+                put("conversation_id", conversationId)
+            }
         }.toString()
+
         connection.outputStream.bufferedWriter().use { it.write(body) }
-        val response = if (connection.responseCode in 200..299) connection.inputStream.bufferedReader().use { it.readText() } else connection.errorStream.bufferedReader().use { it.readText() }
-        val json = JSONObject(response)
-        val answer = if (BuildConfig.DIFY_API_MODE == "workflow") json.optJSONObject("data")?.optJSONObject("outputs")?.optString("text") ?: "" else json.optString("answer")
-        return Result(answer, json.optString("conversation_id"))
+        
+        val responseCode = connection.responseCode
+        val responseText = if (responseCode in 200..299) {
+            connection.inputStream.bufferedReader().use { it.readText() }
+        } else {
+            connection.errorStream?.bufferedReader()?.use { it.readText() } ?: "Error $responseCode"
+        }
+
+        val json = JSONObject(responseText)
+        
+        val finalAnswer = if (isWorkflow) {
+            val data = json.optJSONObject("data")
+            val outputs = data?.optJSONObject("outputs")
+            // Ищем ответ в разных возможных полях Dify
+            outputs?.optString("text")?.takeIf { it.isNotBlank() }
+                ?: outputs?.optString("answer")?.takeIf { it.isNotBlank() }
+                ?: outputs?.optString("result")?.takeIf { it.isNotBlank() }
+                ?: "Я получила данные, но не смогла найти текст ответа."
+        } else {
+            json.optString("answer")
+        }
+
+        return Result(finalAnswer, json.optString("conversation_id", ""))
     }
 }
 
@@ -454,28 +536,76 @@ private fun VoiceAssistantScreen(
 
 @Composable
 private fun NurAiAvatar(state: AssistantState, inputLevel: Float, onClick: () -> Unit) {
-    val transition = rememberInfiniteTransition()
-    val animatedLevel by animateFloatAsState(inputLevel, tween(100))
-    val breathing by transition.animateFloat(0f, 10f, infiniteRepeatable(tween(2000), RepeatMode.Reverse))
+    val transition = rememberInfiniteTransition(label = "avatar")
     
+    // Эмуляция уровня звука для Lip-Sync когда говорит Нурай
+    val speakingLevel by transition.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(120),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "speakingVoice"
+    )
+
+    val animatedLevel by animateFloatAsState(
+        targetValue = if (state == AssistantState.SPEAKING) speakingLevel else inputLevel,
+        animationSpec = tween(100),
+        label = "lipSync"
+    )
+    
+    val breathing by transition.animateFloat(0f, 8f, infiniteRepeatable(tween(2500), RepeatMode.Reverse))
+    
+    // Анимация направления взгляда (для THINKING состояния)
+    val eyesOffset by animateFloatAsState(
+        targetValue = if (state == AssistantState.THINKING) 15f else 0f,
+        animationSpec = tween(1000),
+        label = "eyesMove"
+    )
+
     Box(modifier = Modifier.size(280.dp).clickable(onClick = onClick), contentAlignment = Alignment.Center) {
         AmbientGlowEffect(state, animatedLevel)
         Canvas(modifier = Modifier.fillMaxSize()) {
             val center = center
-            // Лицо
-            drawOval(color = AuraSurfaceHigh, topLeft = Offset(center.x - 90.dp.toPx(), center.y - 110.dp.toPx() + breathing), size = Size(180.dp.toPx(), 220.dp.toPx()))
-            drawOval(color = AuraMint.copy(alpha = 0.3f), topLeft = Offset(center.x - 90.dp.toPx(), center.y - 110.dp.toPx() + breathing), size = Size(180.dp.toPx(), 220.dp.toPx()), style = Stroke(2.dp.toPx()))
             
-            // Глаза
-            val eyeY = center.y - 30.dp.toPx() + breathing
-            val blink = if (state == AssistantState.IDLE && (System.currentTimeMillis() % 4000 > 3800)) 0.1f else 1f
-            drawCircle(AuraCyan, 8.dp.toPx(), Offset(center.x - 40.dp.toPx(), eyeY), alpha = blink)
-            drawCircle(AuraCyan, 8.dp.toPx(), Offset(center.x + 40.dp.toPx(), eyeY), alpha = blink)
+            // 1. ЛИЦО (Чуть более изящное)
+            drawOval(
+                color = AuraSurfaceHigh, 
+                topLeft = Offset(center.x - 85.dp.toPx(), center.y - 115.dp.toPx() + breathing), 
+                size = Size(170.dp.toPx(), 230.dp.toPx())
+            )
+            drawOval(
+                color = AuraMint.copy(alpha = 0.4f), 
+                topLeft = Offset(center.x - 85.dp.toPx(), center.y - 115.dp.toPx() + breathing), 
+                size = Size(170.dp.toPx(), 230.dp.toPx()), 
+                style = Stroke(1.5.dp.toPx())
+            )
             
-            // Рот
-            val mouthY = center.y + 40.dp.toPx() + breathing
-            val mHeight = if (state == AssistantState.SPEAKING) 5.dp.toPx() + animatedLevel * 30.dp.toPx() else 2.dp.toPx()
-            drawOval(AuraCyan, topLeft = Offset(center.x - 20.dp.toPx(), mouthY - mHeight/2), size = Size(40.dp.toPx(), mHeight))
+            // 2. ГЛАЗА
+            val eyeY = center.y - 35.dp.toPx() + breathing
+            val blink = if (state == AssistantState.IDLE && (System.currentTimeMillis() % 5000 > 3850)) 0.1f else 1f
+            
+            // Левый глаз
+            drawCircle(AuraCyan, 7.dp.toPx(), Offset(center.x - 35.dp.toPx() + eyesOffset, eyeY), alpha = blink)
+            // Правый глаз
+            drawCircle(AuraCyan, 7.dp.toPx(), Offset(center.x + 35.dp.toPx() + eyesOffset, eyeY), alpha = blink)
+            
+            // 3. РОТ (Улучшенный Lip-Sync)
+            val mouthY = center.y + 45.dp.toPx() + breathing
+            val mHeight = if (state == AssistantState.SPEAKING) {
+                (5.dp.toPx() + animatedLevel * 25.dp.toPx())
+            } else if (state == AssistantState.LISTENING) {
+                2.dp.toPx() // Слегка приоткрыт при слушании
+            } else {
+                1.dp.toPx() // Закрыт
+            }
+            
+            drawOval(
+                color = if (state == AssistantState.SPEAKING) AuraMint else AuraCyan,
+                topLeft = Offset(center.x - 18.dp.toPx(), mouthY - mHeight/2),
+                size = Size(36.dp.toPx(), mHeight)
+            )
         }
     }
 }
